@@ -514,6 +514,159 @@ class TensorUtilsTest(parameterized.TestCase):
     with self.subTest(name="CheckScaleValue"):
       self.assertEqual(scale[0], expected_scale)
 
+  @parameterized.parameters(2, 4, 8)
+  def test_tensor_zp_scale_from_min_max_blockwise_zero_block_never_zero_scale(
+      self, num_bits
+  ):
+    """No bit width may emit a zero scale: it makes quantization divide by 0."""
+    zeros = np.zeros((4, 1))
+    _, scale = uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+        zeros,
+        zeros,
+        num_bits,
+        True,
+        qtyping.QuantGranularity.BLOCKWISE_32,
+    )
+    # Blockwise scales are serialized as float16, so check survival of the cast.
+    self.assertTrue(
+        np.all(scale.astype(np.float16) > 0), f"scale underflowed: {scale}"
+    )
+
+  @parameterized.parameters(
+      # A zero block and a tiny but non-zero block.
+      0.0,
+      1e-4,
+  )
+  def test_tensor_zp_scale_from_min_max_blockwise_int4_scale_is_normal_fp16(
+      self, magnitude
+  ):
+    """int4 blockwise is consumed by XNNPACK, which requires isnormal scales."""
+    max_val = np.full((4, 1), magnitude)
+    _, scale = uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+        -max_val,
+        max_val,
+        4,
+        True,
+        qtyping.QuantGranularity.BLOCKWISE_32,
+    )
+    # A non-zero check is not enough here: subnormal scales are rejected too.
+    self.assertTrue(
+        np.all(scale.astype(np.float16) >= np.finfo(np.float16).tiny),
+        f"scale is not a normal float16: {scale}",
+    )
+
+  def test_tensor_zp_scale_from_min_max_blockwise_int8_scale_not_inflated(self):
+    """int8 blockwise must not pay the normal-fp16 floor it cannot benefit from.
+
+    XNNPACK only accepts int4 blockwise, so raising int8 scales to
+    qmax * 2**-14 would coarsen whole small-magnitude layers for no gain.
+    """
+    max_val = np.full((4, 1), 1e-4)
+    _, scale = uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+        -max_val,
+        max_val,
+        8,
+        True,
+        qtyping.QuantGranularity.BLOCKWISE_32,
+    )
+    # Subnormal, and that is intentional: the true scale must be preserved.
+    self.assertTrue(
+        np.all(scale < np.finfo(np.float16).tiny), f"scale inflated: {scale}"
+    )
+    self.assertTrue(np.allclose(scale, 1e-4 / 127, rtol=0.2), f"scale: {scale}")
+
+  def test_tensor_zp_scale_from_min_max_blockwise_normal_block_unchanged(self):
+    """The clamp must not perturb blocks that are already in range."""
+    max_val = np.full((4, 1), 1.0)
+    _, scale = uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+        -max_val,
+        max_val,
+        4,
+        True,
+        qtyping.QuantGranularity.BLOCKWISE_32,
+    )
+    # 1/7 is far above float16 tiny, so the clamp must be a no-op here. Only
+    # the 7 bit mantissa rounding below it may perturb the value.
+    self.assertTrue(np.allclose(scale, 1.0 / 7, rtol=1e-2), f"scale: {scale}")
+
+  def test_tensor_zp_scale_from_min_max_channelwise_scale_not_clamped(self):
+    """Channelwise scales stay float32 and must not be touched by the clamp."""
+    max_val = np.full((4, 1), 1e-6)
+    _, scale = uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+        -max_val,
+        max_val,
+        4,
+        True,
+        qtyping.QuantGranularity.CHANNELWISE,
+    )
+    self.assertTrue(np.allclose(scale, 1e-6 / 7), f"scale: {scale}")
+
+  def test_float16_boundary_constants_match_numpy(self):
+    """The hand-written literals must equal what numpy reports."""
+    self.assertEqual(
+        uniform_quantize_tensor._FLOAT16_SMALLEST_NORMAL,
+        np.finfo(np.float16).tiny,
+    )
+    self.assertEqual(
+        uniform_quantize_tensor._FLOAT16_SMALLEST_SUBNORMAL,
+        np.finfo(np.float16).smallest_subnormal,
+    )
+
+  def test_tensor_zp_scale_from_min_max_blockwise_asymmetric_raises(self):
+    """Asymmetric blockwise would desync zp from the clamped scale."""
+    max_val = np.full((4, 1), 1.0)
+    with self.assertRaisesRegex(ValueError, "must be symmetric"):
+      uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+          -max_val,
+          max_val,
+          4,
+          False,
+          qtyping.QuantGranularity.BLOCKWISE_32,
+      )
+
+  def test_tensor_zp_scale_from_min_max_blockwise_clamp_warns_per_severity(
+      self,
+  ):
+    """A few dead blocks and a wholly undersized tensor log differently."""
+    # 1 of 16 blocks dead -> below the alert fraction.
+    max_val = np.full((16, 1), 1.0)
+    max_val[0] = 0.0
+    with self.assertLogs(level="WARNING") as logs:
+      uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+          -max_val,
+          max_val,
+          4,
+          True,
+          qtyping.QuantGranularity.BLOCKWISE_32,
+      )
+    self.assertIn("raised 1 of 16", "".join(logs.output))
+
+    # Every block undersized -> escalated message.
+    max_val = np.full((16, 1), 1e-6)
+    with self.assertLogs(level="WARNING") as logs:
+      uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+          -max_val,
+          max_val,
+          4,
+          True,
+          qtyping.QuantGranularity.BLOCKWISE_32,
+      )
+    self.assertIn("systematically too small", "".join(logs.output))
+
+  def test_tensor_zp_scale_from_min_max_blockwise_no_warning_when_in_range(
+      self,
+  ):
+    """An ordinary tensor must not emit a clamp warning."""
+    max_val = np.full((4, 1), 1.0)
+    with self.assertNoLogs(level="WARNING"):
+      uniform_quantize_tensor.tensor_zp_scale_from_min_max(
+          -max_val,
+          max_val,
+          4,
+          True,
+          qtyping.QuantGranularity.BLOCKWISE_32,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()
