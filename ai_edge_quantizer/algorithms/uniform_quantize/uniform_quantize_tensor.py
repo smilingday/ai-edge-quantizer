@@ -17,10 +17,24 @@
 
 import dataclasses
 from typing import Any, Optional, Sequence
+from absl import logging
 import ml_dtypes
 import numpy as np
 from ai_edge_quantizer import qtyping
 from ai_edge_quantizer.utils import tfl_flatbuffer_utils
+
+
+# float16 representability boundaries, used to keep serialized blockwise scales
+# inside the range consumers can handle. Spelled as literals rather than read
+# from np.finfo(np.float16) because `smallest_subnormal` only exists in NumPy
+# >= 1.22 and this package does not pin a NumPy floor. Both are powers of two,
+# so they are exactly representable in bfloat16 and float16 alike.
+_FLOAT16_SMALLEST_NORMAL = 2.0**-14  # np.finfo(np.float16).tiny
+_FLOAT16_SMALLEST_SUBNORMAL = 2.0**-24  # np.finfo(np.float16).smallest_subnormal
+
+# Fraction of clamped scales in a tensor above which the clamp is reported as a
+# systematic scaling problem rather than a handful of dead blocks.
+_BLOCKWISE_CLAMP_ALERT_FRACTION = 0.1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -575,6 +589,67 @@ def tensor_zp_scale_from_min_max(
     zp = np.rint(zp)
 
   if is_blockwise(granularity):
+    # Blockwise scales are serialized as float16 (see
+    # transformations/quantize_tensor.py), which imposes two distinct
+    # requirements:
+    #
+    # 1. The scale must never be exactly zero. The round trip below happens
+    #    before the weights are quantized, so a zero scale turns the division
+    #    in uniform_quantize() into NaN. This applies at every bit width.
+    # 2. int4 blockwise tensors are additionally consumed by the XNNPACK
+    #    delegate, which rejects a tensor outright if any of its scales fails
+    #    std::isnormal. That requires a floor of qmax * 2**-14.
+    #
+    # Requirement 2 is deliberately limited to int4. The floor grows with qmax
+    # while weight magnitudes do not, so at qmax=7 it only binds on degenerate
+    # blocks (no measurable SQNR change), whereas at qmax=127 it would bind on
+    # entire small-magnitude layers and cost >10 dB. XNNPACK only accepts int4
+    # blockwise today, so wider types would pay that cost for no benefit. If
+    # XNNPACK gains support for other blockwise widths, extend this floor.
+    if not symmetric:
+      # The clamp below runs after the asymmetric branch has already derived zp
+      # from scale, so changing scale here would leave the two inconsistent.
+      # Blockwise has no zero point today (see b/404909258) and the default
+      # policy only permits symmetric blockwise, so this is unreachable. If
+      # asymmetric blockwise is added, move the clamp above the zp computation
+      # instead of relaxing this check.
+      raise ValueError(
+          "Blockwise quantization must be symmetric; got symmetric=False for"
+          f" granularity {granularity}."
+      )
+    if num_bits == 4:
+      scale_floor = _FLOAT16_SMALLEST_NORMAL
+    else:
+      scale_floor = _FLOAT16_SMALLEST_SUBNORMAL
+    num_clamped = int(np.count_nonzero(scale < scale_floor))
+    if num_clamped:
+      clamped_fraction = num_clamped / scale.size
+      if clamped_fraction >= _BLOCKWISE_CLAMP_ALERT_FRACTION:
+        logging.warning(
+            "Blockwise quantization: %.1f%% of this tensor's %d-bit scales"
+            " (%d of %d) fell below the float16 floor %g and were raised to"
+            " it. At this rate the tensor is systematically too small to be"
+            " represented at this bit width rather than merely containing a"
+            " few dead blocks, and it will be materially coarser than the"
+            " recipe implies. Consider a different granularity or rescaling"
+            " the layer.",
+            clamped_fraction * 100,
+            num_bits,
+            num_clamped,
+            scale.size,
+            scale_floor,
+        )
+      else:
+        logging.warning(
+            "Blockwise quantization: raised %d of %d %d-bit scales to the"
+            " float16 floor %g. Those blocks have a near-zero magnitude and"
+            " will be coarser than the recipe implies.",
+            num_clamped,
+            scale.size,
+            num_bits,
+            scale_floor,
+        )
+    scale = np.maximum(scale, scale_floor)
     # Round the scale values to 7 bit mantissa.
     scale = (
         scale.astype(ml_dtypes.bfloat16).astype(np.float16).astype(np.float32)
